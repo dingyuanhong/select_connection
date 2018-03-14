@@ -1,0 +1,1 @@
+cl.exe client.c -l ws2_32.lib /Yd /Zi
