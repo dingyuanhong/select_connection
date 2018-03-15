@@ -22,7 +22,7 @@
 #include <netinet/tcp.h>
 #include <fcntl.h>
 #include <errno.h>
-typedef int HANDLE;
+typedef int SOCKET;
 
 #endif
 
@@ -42,15 +42,16 @@ int initNetwork()
 	if (ret != 0) return 1;
 	return 0;
 }
-void setnonblocking(HANDLE sock)
+int setnonblocking(SOCKET sock)
 {
 	unsigned long ul=1;
 	int ret=ioctlsocket(sock,FIONBIO,(unsigned long *)&ul);
 	if(ret==SOCKET_ERROR)
 	{
 	}
+	return ret;
 }
-int socket_keepalive(HANDLE socket)
+int socket_keepalive(SOCKET socket)
 {
     int keep_alive = 1;
     int ret = setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, (char*)&keep_alive, sizeof(keep_alive));
@@ -80,23 +81,23 @@ int socket_keepalive(HANDLE socket)
     return 0;
 }
 #else
-void  setnonblocking(HANDLE sock)
+int  setnonblocking(SOCKET sock)
 {
-	int  opts;
-	opts = fcntl(sock,F_GETFL);
+	int  opts = fcntl(sock,F_GETFL);
 	if (opts < 0 )
 	{
 		printf( "fcntl(sock,GETFL) " );
-		exit( 1 );
+		return -1;
 	}
 	opts  =  opts | O_NONBLOCK;
 	if (fcntl(sock,F_SETFL,opts) < 0 )
 	{
 		printf( "fcntl(sock,SETFL,opts) " );
-		exit( 1 );
+		return -1;
 	}
+	return 0;
 }
-int socket_keepalive(HANDLE socket)
+int socket_keepalive(SOCKET socket)
 {
     int optval;
     socklen_t optlen = sizeof(int);
@@ -134,6 +135,45 @@ int socket_keepalive(HANDLE socket)
 	}
 	return 0;
 }
+int socket_sendbuf(SOCKET socket,int size){
+	return setsockopt(socket,SOL_SOCKET,SO_SNDBUF,(const char*)&size,sizeof(int));
+}
+int socket_recvbuf(SOCKET socket,int size){
+	return setsockopt(socket,SOL_SOCKET,SO_RCVBUF,(const char*)&size,sizeof(int));
+}
+int socket_linger(SOCKET socket,int onoff,int linger){
+	struct linger    l;
+	l.l_onoff = onoff;
+	l.l_linger = linger;
+    return setsockopt(socket, SOL_SOCKET, SO_LINGER,(const void *) &l, sizeof(struct linger));
+}
+int socket_sendtimeout(SOCKET socket, int timeout){
+	return setsockopt(socket,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
+}
+int socket_recvtimeout(SOCKET socket, int timeout){
+	return setsockopt(socket,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+}
+uint64_t time_microsecond(){
+	struct timeval tv;
+    gettimeofday(&tv,NULL);
+	return tv.tv_sec*1000000 + tv.tv_usec;
+}
+uint64_t  time_millisecond(){
+	struct timeval tv;
+    gettimeofday(&tv,NULL);
+	return tv.tv_sec*1000 + tv.tv_usec/1000;
+}
+long  time_second(){
+	struct timeval tv;
+    gettimeofday(&tv,NULL);
+	return tv.tv_sec;
+}
+double  time_secondD(){
+	struct timeval tv;
+    gettimeofday(&tv,NULL);
+	double usec = (double)tv.tv_usec;
+	return tv.tv_sec + usec/1000000;
+}
 #endif
 
 void init()
@@ -147,7 +187,7 @@ int main(int argc,char *argv[])
 {
 	init();
 
-	HANDLE fd = socket(AF_INET,SOCK_STREAM,0);
+	SOCKET fd = socket(AF_INET,SOCK_STREAM,0);
 	struct sockaddr_in server = {0};
 	server.sin_family = AF_INET;
 	server.sin_addr.s_addr = inet_addr(argv[1]);
@@ -176,12 +216,12 @@ int main(int argc,char *argv[])
 
 	struct timeval timeout;
 	timeout.tv_sec = 1;
-	timeout.tv_usec = 500;
+	timeout.tv_usec = 0;
 
 	int fd_count = 1;
 	int last_nfds = nfds;
 	printf("begin run...\n");
-	int no_recv = 1;
+	int no_recv = 0;
 	int no_send = 0;
 	fd_set * ptrRecv = &readfds;
 	fd_set * ptrSend = &writefds;
@@ -191,9 +231,9 @@ int main(int argc,char *argv[])
 			break;
 		}
 		nfds = last_nfds;
+
 		readfds = readfds_cache;
 		writefds = writefds_cache;
-
 		ptrRecv = &readfds;
 		ptrSend = &writefds;
 		if(no_recv == 1)
@@ -217,7 +257,7 @@ int main(int argc,char *argv[])
 		{
 			continue;
 		}
-		printf("select %d.\n",ret);
+		printf("%d select %d.\n",time_second(),ret);
 		int i = 0;
 		for (; i <= nfds; i++)
 		{
@@ -225,7 +265,22 @@ int main(int argc,char *argv[])
 			{
 				if (FD_ISSET(i, ptrRecv))
 				{
-					printf("recv...\n");
+					printf("recv %d check...\n",i);
+					char peek;
+					ret = recv(i,&peek,1,MSG_PEEK);
+					if(ret != 1)
+					{
+						if(ret == 0)
+						{
+							FD_CLR(i,&readfds_cache);
+							FD_CLR(i,&writefds_cache);
+							close(i);
+							fd_count--;
+						}
+						printf("recv %d check :%d errno:%d\n",i,ret,errno);
+						continue;
+					}
+					printf("recv %d ...\n",i);
 					char buffer[65536];
 					ret = recv(i,buffer,65535,0);
 					if(ret == -1)
@@ -234,25 +289,26 @@ int main(int argc,char *argv[])
 						{
 							continue;
 						}
-						printf("recv close.%d\n",errno);
+						printf("recv %d close.%d\n",errno,i);
 						FD_CLR(i,&readfds_cache);
 						FD_CLR(i,&writefds_cache);
 						close(i);
-						printf("close.");
+						printf("close %d.",i);
 						fd_count--;
 						continue;
 					}else if(ret == 0)
 					{
-						printf("recv close.\n");
+						printf("recv %d close.\n",i);
 						FD_CLR(i,&readfds_cache);
 						FD_CLR(i,&writefds_cache);
 						close(i);
-						printf("close.");
+						printf("close %d.",i);
 						fd_count--;
 						continue;
 					}else{
 						buffer[ret] = 0x00;
 						// printf("%s\n",buffer);
+						printf("recv %i %d\n",i,ret);
 					}
 				}
 			}
@@ -260,7 +316,7 @@ int main(int argc,char *argv[])
 			{
 				if(FD_ISSET(i, &writefds))
 				{
-					printf("send...\n");
+					printf("send %d ...\n",i);
 					ret = send(i,"client",6,0);
 					if(ret == -1)
 					{
@@ -268,14 +324,14 @@ int main(int argc,char *argv[])
 						{
 							continue;
 						}
-						printf("send close.%d\n",errno);
+						printf("send %d close.%d\n",i,errno);
 						FD_CLR(i,&readfds_cache);
 						FD_CLR(i,&writefds_cache);
 						close(i);
-						printf("close.");
+						printf("close %d.",i);
 						fd_count--;
 					}else{
-						printf("send %d\n",ret);
+						printf("send %d %d\n",i,ret);
 					}
 				}
 			}
